@@ -1,7 +1,104 @@
-# SimdSketch
-
+# Origin
+(very) Largely based on SimdSketch
 [![crates.io](https://img.shields.io/crates/v/simd-sketch.svg)](https://crates.io/crates/simd-sketch)
 [![docs.rs](https://img.shields.io/docsrs/simd-sketch.svg)](https://docs.rs/simd-sketch)
+
+# Quickstart
+This repository includes a CLI that can sketch FASTA/FASTQ files, compute Jaccard similarity
+between sketches, list intersection k-mers, and emit sourmash-style JSON signatures.
+
+## Build
+This crate uses nightly features. Install Rust nightly and build the binary:
+
+```bash
+rustup toolchain install nightly
+cargo +nightly build --release
+```
+
+The binary is named `Comer` and will be at:
+
+```
+./target/release/Comer
+```
+
+
+
+## Common commands
+Run the CLI directly via the binary:
+
+```bash
+./target/release/Comer <subcommand> [options...]
+```
+
+### 1) Sketch inputs to `.ssketch`
+Writes sketches next to the input files (unless `--no-save`).
+
+```bash
+./target/release/Comer sketch -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa
+```
+
+### 2) Jaccard similarity (unweighted)
+Prints a single line:
+
+```
+Jaccard: <value>
+```
+
+Example:
+
+```bash
+./target/release/Comer dist -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa
+```
+
+### 3) Weighted Jaccard using bcalm/logan headers
+Bcalm/logan FASTA headers use tokens like `km:f:<abundance>` or `km:i:<abundance>`.
+When `--bcalm` is set, abundance is parsed from the header; if missing, it defaults to 1.
+Float abundances are rounded and clamped to `u16`.
+
+Output:
+```
+Weighted Jaccard: <value>
+```
+
+Example:
+
+```bash
+./target/release/Comer dist -k 21 -s 64 --bcalm --weighted examples/data/bcalm_a.fa examples/data/bcalm_b.fa
+```
+
+### 4) Triangle matrix (Phylip-style)
+Outputs a lower-triangular matrix to stdout (or `--output`).
+
+```bash
+./target/release/Comer triangle -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa examples/data/sample_c.fa
+```
+
+### 5) List k-mers in the intersection
+Prints one `u64`-encoded k-mer per line.
+
+```bash
+./target/release/Comer intersect -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa
+```
+
+### 6) Sourmash-style JSON signatures
+Emits JSON with `mins` and `abundances` derived from the selected k-mers.
+
+```bash
+./target/release/Comer signature -k 21 -s 64 examples/data/sample_a.fa
+```
+
+## Notes on outputs
+- **dist** prints `Jaccard: ...` or `Weighted Jaccard: ...` (when `--weighted`).
+- **triangle** prints a Phylip lower-triangular similarity matrix.
+- **intersect** prints `u64` k-mers (2-bit packed DNA).
+- **signature** prints a sourmash-style JSON list of signatures.
+- `.ssketch` files are versioned. If you have older sketches, re-run `sketch` to refresh them.
+- Bucket sketches store real k-mers, so `k <= 32` is required.
+
+## Input formats
+- **FASTA/FASTQ** are supported. For FASTQ, sequences are read and sketched in the same way.
+- **Bcalm/Logan FASTA headers**: abundance can be encoded as `km:f:<float>` or `km:i:<int>`.
+  Example header token: `>u1 LN:i:100 km:f:3.2 L:+:u2:+`
 
 A SIMD-accelerated library to compute two types of sketches:
 - Classic bottom $s$ sketch, containing the $s$ smallest distinct k-mer hashes.
@@ -37,16 +134,15 @@ For the bottom sketch, the **Jaccard similarity** `j` is computed as follows:
 1. Find the smallest `s` distinct k-mer hashes in the union of two sketches.
 2. Return the fraction of these k-mers that occurs in both sketches.
 
-For the bucket sketch, we first identify all buckets that are not left empty by
-both sketches. Then, we take the fraction `j0` of the remaining buckets where they
-are equal. We use **b-bit sketches**, where only the bottom `b` bits of each
-bucket-minimum are stored. This gives a `1/2^b` probability of hash collisions.
-To fix this, we compute `j = (j0 - 1/2^b) / (1 - 1/2^b)` as the similarity
-corrected for these collisions.
+For the bucket sketch, we store the actual selected k-mers (as packed `u64` values)
+and compute **real k-mer Jaccard** directly from the intersection/union of those
+selected k-mers. When abundances are provided, **weighted Jaccard** is computed as:
 
-The **Mash distance** as reported by the CLI is computed as
-`-ln(2*j / (1+j))/k`.
- This is always `>=0`, but can be as large as `inf` for disjoint sets, that have `j=0`.
+```
+sum_k min(a_k, b_k) / sum_k max(a_k, b_k)
+```
+
+The CLI reports **Jaccard similarity** (weighted or unweighted), not Mash distance.
 
 **Implementation notes.**
 Good performance is mostly achieved by using a branch-free implementation: all

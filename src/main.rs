@@ -11,7 +11,9 @@ use itertools::Itertools;
 use log::info;
 use packed_seq::{PackedNSeqVec, PackedSeqVec, SeqVec};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use serde::Serialize;
 use simd_sketch::SketchParams;
+use std::str;
 
 /// Compute the sketch distance between two fasta files.
 #[derive(clap::Parser)]
@@ -29,6 +31,9 @@ enum Command {
         params: SketchParams,
         /// Paths to (directories of) (gzipped) fasta files.
         paths: Vec<PathBuf>,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
         #[arg(long, short = 'j')]
         threads: Option<usize>,
         #[arg(long)]
@@ -42,6 +47,12 @@ enum Command {
         path_a: PathBuf,
         /// Second input fasta file or .ssketch file.
         path_b: PathBuf,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
+        /// Use weighted Jaccard (requires abundances; defaults to 1 when missing).
+        #[arg(long)]
+        weighted: bool,
         #[arg(long, short = 'j')]
         threads: Option<usize>,
     },
@@ -52,6 +63,12 @@ enum Command {
         /// Paths to (directories of) (gzipped) fasta files or .ssketch files.
         /// If <path>.ssketch exists, it is automatically used.
         paths: Vec<PathBuf>,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
+        /// Use weighted Jaccard (requires abundances; defaults to 1 when missing).
+        #[arg(long)]
+        weighted: bool,
         /// Write phylip distance matrix here, or default to stdout.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -69,6 +86,9 @@ enum Command {
         /// Paths to directory of (gzipped) fasta files.
         #[arg(long)]
         targets: Vec<PathBuf>,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
         #[arg(long, short = 'j')]
         threads: Option<usize>,
         #[arg(long)]
@@ -77,6 +97,35 @@ enum Command {
         /// Path to .fastq.gz metagenomic sample
         reads: PathBuf,
     },
+    /// List k-mers in the intersection of two sketches.
+    Intersect {
+        #[command(flatten)]
+        params: SketchParams,
+        /// First input fasta file or .ssketch file.
+        path_a: PathBuf,
+        /// Second input fasta file or .ssketch file.
+        path_b: PathBuf,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
+    },
+    /// Output sourmash-style JSON signatures to stdout.
+    Signature {
+        #[command(flatten)]
+        params: SketchParams,
+        /// Paths to (directories of) (gzipped) fasta files or .ssketch files.
+        paths: Vec<PathBuf>,
+        /// Parse kmers from bcalm/logan FASTA headers (km:f:)
+        #[arg(long)]
+        bcalm: bool,
+        /// Write JSON output here, or default to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
+    },
 }
 
 const BINCODE_CONFIG: bincode::config::Configuration<
@@ -84,11 +133,11 @@ const BINCODE_CONFIG: bincode::config::Configuration<
     bincode::config::Fixint,
 > = bincode::config::standard().with_fixed_int_encoding();
 const EXTENSION: &str = "ssketch";
-const SKETCH_VERSION: usize = 1;
+const SKETCH_VERSION: usize = 2;
 
 #[derive(bincode::Encode, bincode::Decode)]
 pub struct VersionedSketch {
-    /// This version of simd-sketch only supports encoding version 1.
+    /// This version of simd-sketch only supports encoding version 2.
     /// This is encoded first, so that it can (hopefully) still be recovered in case decoding fails.
     version: usize,
     /// The sketch itself.
@@ -104,7 +153,9 @@ fn main() {
     let (Command::Sketch { threads, .. }
     | Command::Dist { threads, .. }
     | Command::Triangle { threads, .. }
-    | Command::Classify { threads, .. }) = &args.command;
+    | Command::Classify { threads, .. }
+    | Command::Intersect { threads, .. }
+    | Command::Signature { threads, .. }) = &args.command;
     if let Some(threads) = threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(*threads)
@@ -119,19 +170,43 @@ fn main() {
             path_b,
             ..
         } => (params, vec![path_a.clone(), path_b.clone()]),
+        Command::Intersect {
+            params,
+            path_a,
+            path_b,
+            ..
+        } => (params, vec![path_a.clone(), path_b.clone()]),
         Command::Sketch { params, paths, .. } | Command::Triangle { params, paths, .. } => {
             (params, collect_paths(&paths))
         }
         Command::Classify {
             params, targets, ..
         } => (params, collect_paths(&targets)),
+        Command::Signature { params, paths, .. } => (params, collect_paths(&paths)),
     };
 
     let save_sketches = match &args.command {
         Command::Sketch { no_save, .. } => !no_save,
         Command::Classify { no_save, .. } => !no_save,
         Command::Dist { .. } => false,
+        Command::Intersect { .. } => false,
+        Command::Signature { .. } => false,
         Command::Triangle { save_sketches, .. } => *save_sketches,
+    };
+
+    let bcalm = match &args.command {
+        Command::Sketch { bcalm, .. } => *bcalm,
+        Command::Dist { bcalm, .. } => *bcalm,
+        Command::Triangle { bcalm, .. } => *bcalm,
+        Command::Classify { bcalm, .. } => *bcalm,
+        Command::Intersect { bcalm, .. } => *bcalm,
+        Command::Signature { bcalm, .. } => *bcalm,
+    };
+
+    let weighted = match &args.command {
+        Command::Dist { weighted, .. } => *weighted,
+        Command::Triangle { weighted, .. } => *weighted,
+        _ => false,
     };
 
     let q = paths.len();
@@ -201,28 +276,44 @@ fn main() {
             let mut sketch;
             if params.filter_out_n {
                 let mut ranges = vec![];
+                let mut abundances = vec![];
                 let mut seq = PackedNSeqVec::default();
                 let mut size = 0;
                 while let Some(r) = reader.next() {
-                    let range = seq.push_ascii(&r.unwrap().seq());
+                    let record = r.unwrap();
+                    let abundance = if bcalm {
+                        parse_bcalm_abundance(record.id())
+                    } else {
+                        1
+                    };
+                    let range = seq.push_ascii(&record.seq());
                     size += range.len();
                     ranges.push(range);
+                    abundances.push(abundance);
                 }
                 total_bytes.fetch_add(size, Relaxed);
                 let slices = ranges.into_iter().map(|r| seq.slice(r)).collect_vec();
-                sketch = sketcher.sketch_seqs(&slices);
+                sketch = sketcher.sketch_seqs_with_abundances(&slices, &abundances);
             } else {
                 let mut ranges = vec![];
+                let mut abundances = vec![];
                 let mut seq = PackedSeqVec::default();
                 let mut size = 0;
                 while let Some(r) = reader.next() {
-                    let range = seq.push_ascii(&r.unwrap().seq());
+                    let record = r.unwrap();
+                    let abundance = if bcalm {
+                        parse_bcalm_abundance(record.id())
+                    } else {
+                        1
+                    };
+                    let range = seq.push_ascii(&record.seq());
                     size += range.len();
                     ranges.push(range);
+                    abundances.push(abundance);
                 }
                 total_bytes.fetch_add(size, Relaxed);
                 let slices = ranges.into_iter().map(|r| seq.slice(r)).collect_vec();
-                sketch = sketcher.sketch_seqs(&slices);
+                sketch = sketcher.sketch_seqs_with_abundances(&slices, &abundances);
             }
             num_sketched.fetch_add(1, Relaxed);
 
@@ -272,6 +363,26 @@ fn main() {
         simd_sketch::classify::classify(&sketches, reads);
         return;
     }
+    if let Command::Signature { output, .. } = &args.command {
+        let sigs = sketches
+            .iter()
+            .zip(paths.iter())
+            .map(|(sketch, path)| sketch_to_sourmash(sketch, path))
+            .collect_vec();
+        let json = serde_json::to_vec_pretty(&sigs).unwrap();
+        match output {
+            Some(output) => std::fs::write(output, json).unwrap(),
+            None => println!("{}", str::from_utf8(&json).unwrap()),
+        }
+        return;
+    }
+    if let Command::Intersect { .. } = &args.command {
+        let kmers = sketches[0].intersection_kmers(&sketches[1]);
+        for kmer in kmers {
+            println!("{kmer}");
+        }
+        return;
+    }
 
     let num_pairs = q * (q - 1) / 2;
     let mut pairs = Vec::with_capacity(num_pairs);
@@ -281,18 +392,24 @@ fn main() {
         }
     }
     let start = std::time::Instant::now();
-    let dists: Vec<_> = pairs
+    let sims: Vec<_> = pairs
         .into_par_iter()
         .progress_with_style(style.clone())
-        .with_message("Distances")
+        .with_message("Similarities")
         .with_finish(indicatif::ProgressFinish::AndLeave)
-        .map(|(i, j)| sketches[i].mash_distance(&sketches[j]))
+        .map(|(i, j)| {
+            if weighted {
+                sketches[i].weighted_jaccard_similarity(&sketches[j])
+            } else {
+                sketches[i].jaccard_similarity(&sketches[j])
+            }
+        })
         .collect();
     let t_dist = start.elapsed();
 
     let cnt = q * (q - 1) / 2;
     info!(
-        "Computing {cnt} dists took {t_dist:?} ({:?} avg)",
+        "Computing {cnt} similarities took {t_dist:?} ({:?} avg)",
         t_dist / cnt.max(1) as u32
     );
 
@@ -304,7 +421,11 @@ fn main() {
             unreachable!();
         }
         Command::Dist { .. } => {
-            println!("Distance: {:.4}", dists[0]);
+            if weighted {
+                println!("Weighted Jaccard: {:.6}", sims[0]);
+            } else {
+                println!("Jaccard: {:.6}", sims[0]);
+            }
             return;
         }
         Command::Triangle { output, .. } => {
@@ -313,7 +434,7 @@ fn main() {
             // Output Phylip triangle format.
             let mut out = Vec::new();
             writeln!(out, "{q}").unwrap();
-            let mut d = dists.iter();
+            let mut d = sims.iter();
             for i in 0..q {
                 write!(out, "{}", paths[i].to_str().unwrap()).unwrap();
                 for _ in 0..i {
@@ -327,7 +448,101 @@ fn main() {
                 None => println!("{}", str::from_utf8(&out).unwrap()),
             }
         }
+        Command::Intersect { .. } | Command::Signature { .. } => {
+            unreachable!();
+        }
     }
+}
+
+#[derive(Serialize)]
+struct SourmashSignatureFile {
+    class: &'static str,
+    email: &'static str,
+    filename: String,
+    name: String,
+    signatures: Vec<SourmashSignature>,
+    version: f32,
+}
+
+#[derive(Serialize)]
+struct SourmashSignature {
+    ksize: usize,
+    num: usize,
+    seed: u32,
+    hash_function: &'static str,
+    max_hash: u64,
+    molecule: &'static str,
+    mins: Vec<u64>,
+    abundances: Vec<u16>,
+}
+
+fn sketch_to_sourmash(sketch: &simd_sketch::Sketch, path: &PathBuf) -> SourmashSignatureFile {
+    let name = path.to_string_lossy().to_string();
+    match sketch {
+        simd_sketch::Sketch::BucketSketch(bucket) => {
+            let mut mins = Vec::new();
+            let mut abundances = Vec::new();
+            for (&kmer, &abundance) in bucket.kmers.iter().zip(bucket.abundances.iter()) {
+                if kmer == u64::MAX {
+                    continue;
+                }
+                mins.push(kmer);
+                abundances.push(abundance);
+            }
+            SourmashSignatureFile {
+                class: "sourmash_signature",
+                email: "",
+                filename: name.clone(),
+                name,
+                signatures: vec![SourmashSignature {
+                    ksize: bucket.k,
+                    num: mins.len(),
+                    seed: bucket.seed,
+                    hash_function: "simd-sketch-kmer64",
+                    max_hash: 0,
+                    molecule: "DNA",
+                    mins,
+                    abundances,
+                }],
+                version: 0.4,
+            }
+        }
+        _ => panic!("Sourmash output only supported for bucket sketches."),
+    }
+}
+
+fn parse_bcalm_abundance(header: &[u8]) -> u16 {
+    let mut abundance = None;
+
+    let parse_token = |token: &[u8]| -> Option<u16> {
+        if let Some(rest) = token.strip_prefix(b"km:f:") {
+            let s = str::from_utf8(rest).ok()?;
+            let v: f32 = s.parse().ok()?;
+            if !v.is_finite() {
+                return None;
+            }
+            let v = v.round().clamp(0.0, u16::MAX as f32);
+            return Some(v as u16);
+        }
+        if let Some(rest) = token.strip_prefix(b"km:i:") {
+            let s = str::from_utf8(rest).ok()?;
+            let v: u32 = s.parse().ok()?;
+            return Some(v.min(u16::MAX as u32) as u16);
+        }
+        None
+    };
+
+    for token in header.split(|b| b.is_ascii_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(v) = parse_token(token) {
+            abundance = Some(v);
+            break;
+        }
+    }
+
+    abundance.unwrap_or(1)
 }
 
 fn collect_paths(paths: &Vec<PathBuf>) -> Vec<PathBuf> {

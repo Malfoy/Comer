@@ -9,6 +9,10 @@ categories = ["compression", "data-structures", "science::bioinformatics"]
 authors = ["Ragnar Groot Koerkamp"]
 description = "A SIMD-accelerated library to compute a b-bit bottom-h sketch"
 
+[[bin]]
+name = "Comer"
+path = "src/main.rs"
+
 [profile.release]
 opt-level = 3
 panic = "abort"
@@ -42,6 +46,8 @@ log = "0.4.27"
 env_logger = { version = "0.11.8", default-features = false }
 indicatif = { version = "0.18.0", features = ["rayon"] }
 bincode = "2.0.1"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
 
 packed-seq = "4.3.0"
 # seq-hash = "0.1.1"

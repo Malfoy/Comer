@@ -1305,6 +1305,8 @@ dependencies = [
  "rand",
  "rayon",
  "seq-hash",
+ "serde",
+ "serde_json",
  "wide",
 ]
 
