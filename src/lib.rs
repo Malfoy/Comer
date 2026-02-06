@@ -163,6 +163,7 @@ pub enum Sketch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PackedKmer {
+    U32(u32),
     U64(u64),
     U128(u128),
 }
@@ -170,6 +171,7 @@ pub enum PackedKmer {
 impl fmt::Display for PackedKmer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PackedKmer::U32(kmer) => write!(f, "{kmer}"),
             PackedKmer::U64(kmer) => write!(f, "{kmer}"),
             PackedKmer::U128(kmer) => write!(f, "{kmer}"),
         }
@@ -351,7 +353,7 @@ pub struct BucketSketch {
     pub buckets: BitSketch,
     /// Bit-vector indicating empty buckets, so the similarity score can be adjusted accordingly.
     pub empty: Vec<u64>,
-    /// Selected k-mers for each bucket (`u64::MAX`/`u128::MAX` when empty).
+    /// Selected k-mers for each bucket (`u32::MAX`/`u64::MAX`/`u128::MAX` when empty).
     pub kmers: BucketKmers,
     /// Abundance of each selected k-mer (defaults to 1).
     pub abundances: Vec<u16>,
@@ -359,6 +361,7 @@ pub struct BucketSketch {
 
 #[derive(bincode::Encode, bincode::Decode, Debug, mem_dbg::MemSize)]
 pub enum BucketKmers {
+    U32(Vec<u32>),
     U64(Vec<u64>),
     U128(Vec<u128>),
 }
@@ -366,6 +369,7 @@ pub enum BucketKmers {
 impl BucketKmers {
     fn len(&self) -> usize {
         match self {
+            BucketKmers::U32(v) => v.len(),
             BucketKmers::U64(v) => v.len(),
             BucketKmers::U128(v) => v.len(),
         }
@@ -468,6 +472,7 @@ impl BucketSketch {
         assert_eq!(self.rc, other.rc);
         assert_eq!(self.k, other.k);
         match (&self.kmers, &other.kmers) {
+            (BucketKmers::U32(a), BucketKmers::U32(b)) => jaccard_similarity_impl(a, b, u32::MAX),
             (BucketKmers::U64(a), BucketKmers::U64(b)) => jaccard_similarity_impl(a, b, u64::MAX),
             (BucketKmers::U128(a), BucketKmers::U128(b)) => {
                 jaccard_similarity_impl(a, b, u128::MAX)
@@ -483,6 +488,13 @@ impl BucketSketch {
         assert_eq!(self.rc, other.rc);
         assert_eq!(self.k, other.k);
         match (&self.kmers, &other.kmers) {
+            (BucketKmers::U32(a), BucketKmers::U32(b)) => weighted_jaccard_similarity_impl(
+                a,
+                &self.abundances,
+                b,
+                &other.abundances,
+                u32::MAX,
+            ),
             (BucketKmers::U64(a), BucketKmers::U64(b)) => weighted_jaccard_similarity_impl(
                 a,
                 &self.abundances,
@@ -507,6 +519,9 @@ impl BucketSketch {
         assert_eq!(self.rc, other.rc);
         assert_eq!(self.k, other.k);
         match (&self.kmers, &other.kmers) {
+            (BucketKmers::U32(a), BucketKmers::U32(b)) => {
+                intersection_kmers_impl(a, b, u32::MAX, PackedKmer::U32)
+            }
             (BucketKmers::U64(a), BucketKmers::U64(b)) => {
                 intersection_kmers_impl(a, b, u64::MAX, PackedKmer::U64)
             }
@@ -825,10 +840,33 @@ impl Sketcher {
             "k must be <= 63 to store packed k-mers in u128"
         );
 
-        if self.params.k <= 32 {
+        if self.params.k <= 16 {
+            self.bucket_sketch_with_abundances_u32(seqs, abundances)
+        } else if self.params.k <= 32 {
             self.bucket_sketch_with_abundances_u64(seqs, abundances)
         } else {
             self.bucket_sketch_with_abundances_u128(seqs, abundances)
+        }
+    }
+
+    #[inline(always)]
+    fn for_each_kmer_hash_and_value_u32<S: KmerSource, F: FnMut(u32, u32)>(&self, seq: S, f: F) {
+        if self.params.rc {
+            seq.for_each_kmer_hash_and_value_u32(
+                &self.rc_hasher,
+                self.params.k,
+                self.params.rc,
+                self.params.filter_out_n,
+                f,
+            );
+        } else {
+            seq.for_each_kmer_hash_and_value_u32(
+                &self.fwd_hasher,
+                self.params.k,
+                self.params.rc,
+                self.params.filter_out_n,
+                f,
+            );
         }
     }
 
@@ -872,6 +910,58 @@ impl Sketcher {
                 f,
             );
         }
+    }
+
+    fn bucket_sketch_with_abundances_u32<'s, S: Sketchable + KmerSource>(
+        &self,
+        seqs: &[S],
+        abundances: &[u16],
+    ) -> BucketSketch {
+        let mut buckets = vec![u32::MAX; self.params.s];
+        let mut kmers = vec![u32::MAX; self.params.s];
+        let mut kmer_abundances = vec![1u16; self.params.s];
+        let m = FM32::new(self.params.s as u32);
+
+        if self.params.count <= 1 {
+            for (&seq, &abundance) in seqs.iter().zip(abundances.iter()) {
+                self.for_each_kmer_hash_and_value_u32(seq, |hash, kmer| {
+                    let bucket = m.fastmod(hash);
+                    let min = unsafe { buckets.get_unchecked_mut(bucket) };
+                    if hash < *min {
+                        *min = hash;
+                        unsafe {
+                            *kmers.get_unchecked_mut(bucket) = kmer;
+                            *kmer_abundances.get_unchecked_mut(bucket) = abundance;
+                        }
+                    }
+                });
+            }
+        } else {
+            let mut counts = HashMap::<u32, (u32, u32, u16)>::new();
+            for (&seq, &abundance) in seqs.iter().zip(abundances.iter()) {
+                self.for_each_kmer_hash_and_value_u32(seq, |hash, kmer| {
+                    let entry = counts.entry(hash).or_insert((0, kmer, abundance));
+                    if entry.0 == 0 {
+                        entry.1 = kmer;
+                        entry.2 = abundance;
+                    }
+                    entry.0 = entry.0.saturating_add(1);
+                    if entry.0 == self.params.count as u32 {
+                        let bucket = m.fastmod(hash);
+                        let min = unsafe { buckets.get_unchecked_mut(bucket) };
+                        if hash < *min {
+                            *min = hash;
+                            unsafe {
+                                *kmers.get_unchecked_mut(bucket) = entry.1;
+                                *kmer_abundances.get_unchecked_mut(bucket) = entry.2;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        self.finalize_bucket_sketch(buckets, BucketKmers::U32(kmers), kmer_abundances)
     }
 
     fn bucket_sketch_with_abundances_u64<'s, S: Sketchable + KmerSource>(
@@ -1289,6 +1379,76 @@ fn new_collect(
         .collect()
 }
 
+struct KmerValueIter32<I> {
+    iter: I,
+    k: usize,
+    rc: bool,
+    mask: u32,
+    fwd: u32,
+    rev: u32,
+    valid_len: usize,
+    seen: usize,
+    rev_shift: u32,
+}
+
+impl<I: Iterator<Item = (u8, bool)>> KmerValueIter32<I> {
+    fn new(iter: I, k: usize, rc: bool) -> Self {
+        let mask = if k >= 16 {
+            u32::MAX
+        } else {
+            (1u32 << (2 * k)) - 1
+        };
+        let rev_shift = if k == 0 { 0 } else { (2 * (k - 1)) as u32 };
+        Self {
+            iter,
+            k,
+            rc,
+            mask,
+            fwd: 0,
+            rev: 0,
+            valid_len: 0,
+            seen: 0,
+            rev_shift,
+        }
+    }
+}
+
+impl<I: Iterator<Item = (u8, bool)>> Iterator for KmerValueIter32<I> {
+    type Item = Option<u32>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (base, invalid) = self.iter.next()?;
+            self.seen += 1;
+            if invalid {
+                self.valid_len = 0;
+                self.fwd = 0;
+                self.rev = 0;
+            } else {
+                self.valid_len = (self.valid_len + 1).min(self.k);
+                self.fwd = ((self.fwd << 2) | base as u32) & self.mask;
+                if self.rc {
+                    let comp = (base ^ 2) as u32;
+                    self.rev = (self.rev >> 2) | (comp << self.rev_shift);
+                }
+            }
+
+            if self.seen < self.k {
+                continue;
+            }
+            if invalid || self.valid_len < self.k {
+                return Some(None);
+            }
+            let kmer = if self.rc {
+                self.fwd.min(self.rev)
+            } else {
+                self.fwd
+            };
+            return Some(Some(kmer));
+        }
+    }
+}
+
 struct KmerValueIter64<I> {
     iter: I,
     k: usize,
@@ -1435,6 +1595,15 @@ fn pack_char_lossy_local(base: u8) -> u8 {
 }
 
 pub trait KmerSource: Copy {
+    fn for_each_kmer_hash_and_value_u32<H: KmerHasher, F: FnMut(u32, u32)>(
+        self,
+        hasher: &H,
+        k: usize,
+        rc: bool,
+        filter_out_n: bool,
+        f: F,
+    );
+
     fn for_each_kmer_hash_and_value_u64<H: KmerHasher, F: FnMut(u32, u64)>(
         self,
         hasher: &H,
@@ -1455,6 +1624,36 @@ pub trait KmerSource: Copy {
 }
 
 impl KmerSource for &[u8] {
+    fn for_each_kmer_hash_and_value_u32<H: KmerHasher, F: FnMut(u32, u32)>(
+        self,
+        hasher: &H,
+        k: usize,
+        rc: bool,
+        filter_out_n: bool,
+        mut f: F,
+    ) {
+        let hash_iter = hasher.hash_kmers_scalar(packed_seq::AsciiSeq(self));
+        let base_iter = self.iter().map(|&b| {
+            if filter_out_n {
+                match b {
+                    b'A' | b'a' => (0u8, false),
+                    b'C' | b'c' => (1u8, false),
+                    b'G' | b'g' => (3u8, false),
+                    b'T' | b't' => (2u8, false),
+                    _ => (0u8, true),
+                }
+            } else {
+                (pack_char_lossy_local(b), false)
+            }
+        });
+        let kmer_iter = KmerValueIter32::new(base_iter, k, rc);
+        for (hash, kmer) in hash_iter.zip(kmer_iter) {
+            if let Some(kmer) = kmer {
+                f(hash, kmer);
+            }
+        }
+    }
+
     fn for_each_kmer_hash_and_value_u64<H: KmerHasher, F: FnMut(u32, u64)>(
         self,
         hasher: &H,
@@ -1517,6 +1716,36 @@ impl KmerSource for &[u8] {
 }
 
 impl KmerSource for packed_seq::AsciiSeq<'_> {
+    fn for_each_kmer_hash_and_value_u32<H: KmerHasher, F: FnMut(u32, u32)>(
+        self,
+        hasher: &H,
+        k: usize,
+        rc: bool,
+        filter_out_n: bool,
+        mut f: F,
+    ) {
+        let hash_iter = hasher.hash_kmers_scalar(self);
+        let base_iter = self.0.iter().map(|&b| {
+            if filter_out_n {
+                match b {
+                    b'A' | b'a' => (0u8, false),
+                    b'C' | b'c' => (1u8, false),
+                    b'G' | b'g' => (3u8, false),
+                    b'T' | b't' => (2u8, false),
+                    _ => (0u8, true),
+                }
+            } else {
+                (pack_char_lossy_local(b), false)
+            }
+        });
+        let kmer_iter = KmerValueIter32::new(base_iter, k, rc);
+        for (hash, kmer) in hash_iter.zip(kmer_iter) {
+            if let Some(kmer) = kmer {
+                f(hash, kmer);
+            }
+        }
+    }
+
     fn for_each_kmer_hash_and_value_u64<H: KmerHasher, F: FnMut(u32, u64)>(
         self,
         hasher: &H,
@@ -1579,6 +1808,24 @@ impl KmerSource for packed_seq::AsciiSeq<'_> {
 }
 
 impl KmerSource for packed_seq::PackedSeq<'_> {
+    fn for_each_kmer_hash_and_value_u32<H: KmerHasher, F: FnMut(u32, u32)>(
+        self,
+        hasher: &H,
+        k: usize,
+        rc: bool,
+        _filter_out_n: bool,
+        mut f: F,
+    ) {
+        let hash_iter = hasher.hash_kmers_scalar(self);
+        let base_iter = self.iter_bp().map(|b| (b, false));
+        let kmer_iter = KmerValueIter32::new(base_iter, k, rc);
+        for (hash, kmer) in hash_iter.zip(kmer_iter) {
+            if let Some(kmer) = kmer {
+                f(hash, kmer);
+            }
+        }
+    }
+
     fn for_each_kmer_hash_and_value_u64<H: KmerHasher, F: FnMut(u32, u64)>(
         self,
         hasher: &H,
@@ -1617,6 +1864,41 @@ impl KmerSource for packed_seq::PackedSeq<'_> {
 }
 
 impl KmerSource for PackedNSeq<'_> {
+    fn for_each_kmer_hash_and_value_u32<H: KmerHasher, F: FnMut(u32, u32)>(
+        self,
+        hasher: &H,
+        k: usize,
+        rc: bool,
+        filter_out_n: bool,
+        mut f: F,
+    ) {
+        let hash_iter: Box<dyn Iterator<Item = u32>> = if filter_out_n {
+            Box::new(hasher.hash_valid_kmers_scalar(self))
+        } else {
+            Box::new(hasher.hash_kmers_scalar(self.seq))
+        };
+        let base_iter: Box<dyn Iterator<Item = (u8, bool)>> = if filter_out_n {
+            Box::new(
+                self.seq
+                    .iter_bp()
+                    .zip(self.ambiguous.iter_bp())
+                    .map(|(b, amb)| (b, amb != 0)),
+            )
+        } else {
+            Box::new(self.seq.iter_bp().map(|b| (b, false)))
+        };
+
+        let kmer_iter = KmerValueIter32::new(base_iter, k, rc);
+        for (hash, kmer) in hash_iter.zip(kmer_iter) {
+            if hash == u32::MAX {
+                continue;
+            }
+            if let Some(kmer) = kmer {
+                f(hash, kmer);
+            }
+        }
+    }
+
     fn for_each_kmer_hash_and_value_u64<H: KmerHasher, F: FnMut(u32, u64)>(
         self,
         hasher: &H,
@@ -1917,7 +2199,7 @@ mod test {
     #[test]
     fn bucket_runtime_dispatch_picks_width_from_k() {
         let seq = packed_seq::AsciiSeqVec::random(400);
-        for (k, expect_u128) in [(31, false), (63, true)] {
+        for (k, expected) in [(16, 32), (31, 64), (63, 128)] {
             let sketcher = crate::SketchParams {
                 alg: SketchAlg::Bucket,
                 rc: true,
@@ -1936,12 +2218,36 @@ mod test {
                 panic!("expected bucket sketch")
             };
 
-            match (&bucket.kmers, expect_u128) {
-                (BucketKmers::U64(_), false) => {}
-                (BucketKmers::U128(_), true) => {}
+            match (&bucket.kmers, expected) {
+                (BucketKmers::U32(_), 32) => {}
+                (BucketKmers::U64(_), 64) => {}
+                (BucketKmers::U128(_), 128) => {}
                 _ => panic!("unexpected k-mer storage width for k={k}"),
             }
         }
+    }
+
+    #[test]
+    fn bucket_supports_k16() {
+        let seq = packed_seq::AsciiSeqVec::random(600);
+        let sketcher = crate::SketchParams {
+            alg: SketchAlg::Bucket,
+            rc: true,
+            k: 16,
+            s: 256,
+            b: 8,
+            seed: 0,
+            count: 0,
+            coverage: 1,
+            filter_empty: false,
+            filter_out_n: false,
+        }
+        .build();
+        let sketch = sketcher.sketch(seq.as_slice());
+
+        assert_eq!(sketch.mash_distance(&sketch), 0.0);
+        let kmers = sketch.intersection_kmers(&sketch);
+        assert!(kmers.iter().all(|kmer| matches!(kmer, PackedKmer::U32(_))));
     }
 
     #[test]

@@ -133,11 +133,11 @@ const BINCODE_CONFIG: bincode::config::Configuration<
     bincode::config::Fixint,
 > = bincode::config::standard().with_fixed_int_encoding();
 const EXTENSION: &str = "ssketch";
-const SKETCH_VERSION: usize = 3;
+const SKETCH_VERSION: usize = 4;
 
 #[derive(bincode::Encode, bincode::Decode)]
 pub struct VersionedSketch {
-    /// This version of simd-sketch only supports encoding version 3.
+    /// This version of simd-sketch only supports encoding version 4.
     /// This is encoded first, so that it can (hopefully) still be recovered in case decoding fails.
     version: usize,
     /// The sketch itself.
@@ -479,6 +479,7 @@ struct SourmashSignature {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum SignatureMins {
+    U32(Vec<u32>),
     U64(Vec<u64>),
     U128(Vec<String>),
 }
@@ -486,6 +487,7 @@ enum SignatureMins {
 impl SignatureMins {
     fn len(&self) -> usize {
         match self {
+            SignatureMins::U32(v) => v.len(),
             SignatureMins::U64(v) => v.len(),
             SignatureMins::U128(v) => v.len(),
         }
@@ -497,6 +499,18 @@ fn sketch_to_sourmash(sketch: &simd_sketch::Sketch, path: &PathBuf) -> SourmashS
     match sketch {
         simd_sketch::Sketch::BucketSketch(bucket) => {
             let (mins, abundances, hash_function) = match &bucket.kmers {
+                simd_sketch::BucketKmers::U32(kmers) => {
+                    let mut mins = Vec::new();
+                    let mut abundances = Vec::new();
+                    for (&kmer, &abundance) in kmers.iter().zip(bucket.abundances.iter()) {
+                        if kmer == u32::MAX {
+                            continue;
+                        }
+                        mins.push(kmer);
+                        abundances.push(abundance);
+                    }
+                    (SignatureMins::U32(mins), abundances, "simd-sketch-kmer32")
+                }
                 simd_sketch::BucketKmers::U64(kmers) => {
                     let mut mins = Vec::new();
                     let mut abundances = Vec::new();

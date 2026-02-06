@@ -74,7 +74,7 @@ Outputs a lower-triangular matrix to stdout (or `--output`).
 ```
 
 ### 5) List k-mers in the intersection
-Prints one packed k-mer per line (`u64` for `k<=32`, `u128` for larger `k`).
+Prints one packed k-mer per line (`u32` for `k<=16`, `u64` for `17<=k<=32`, `u128` for larger `k`).
 
 ```bash
 ./target/release/Comer intersect -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa
@@ -92,7 +92,8 @@ Emits JSON with `mins` and `abundances` derived from the selected k-mers.
 - **triangle** prints a Phylip lower-triangular similarity matrix.
 - **intersect** prints packed k-mers (2-bit packed DNA).
 - **signature** prints a sourmash-style JSON list of signatures.
-  For `k<=32`, `mins` are `u64` numbers.
+  For `k<=16`, `mins` are `u32` numbers.
+  For `17<=k<=32`, `mins` are `u64` numbers.
   For `k>32`, `mins` are decimal strings and `hash_function` is `simd-sketch-kmer128-decimal`.
 - `.ssketch` files are versioned. If you have older sketches, re-run `sketch` to refresh them.
 - Bucket sketches store real packed k-mers, so `k <= 63` is supported.
