@@ -74,7 +74,7 @@ Outputs a lower-triangular matrix to stdout (or `--output`).
 ```
 
 ### 5) List k-mers in the intersection
-Prints one `u64`-encoded k-mer per line.
+Prints one packed k-mer per line (`u64` for `k<=32`, `u128` for larger `k`).
 
 ```bash
 ./target/release/Comer intersect -k 21 -s 64 examples/data/sample_a.fa examples/data/sample_b.fa
@@ -90,10 +90,12 @@ Emits JSON with `mins` and `abundances` derived from the selected k-mers.
 ## Notes on outputs
 - **dist** prints `Jaccard: ...` or `Weighted Jaccard: ...` (when `--weighted`).
 - **triangle** prints a Phylip lower-triangular similarity matrix.
-- **intersect** prints `u64` k-mers (2-bit packed DNA).
+- **intersect** prints packed k-mers (2-bit packed DNA).
 - **signature** prints a sourmash-style JSON list of signatures.
+  For `k<=32`, `mins` are `u64` numbers.
+  For `k>32`, `mins` are decimal strings and `hash_function` is `simd-sketch-kmer128-decimal`.
 - `.ssketch` files are versioned. If you have older sketches, re-run `sketch` to refresh them.
-- Bucket sketches store real k-mers, so `k <= 32` is required.
+- Bucket sketches store real packed k-mers, so `k <= 63` is supported.
 
 ## Input formats
 - **FASTA/FASTQ** are supported. For FASTQ, sequences are read and sketched in the same way.
@@ -157,4 +159,3 @@ The underlying streaming and hashing algorithms are described in the following [
 - SimdMinimizers: Computing random minimizers, fast.
   Ragnar Groot Koerkamp, Igor Martayan
   bioRxiv 2025.01.27 [doi.org/10.1101/2025.01.27.634998](https://doi.org/10.1101/2025.01.27.634998)
-

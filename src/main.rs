@@ -133,11 +133,11 @@ const BINCODE_CONFIG: bincode::config::Configuration<
     bincode::config::Fixint,
 > = bincode::config::standard().with_fixed_int_encoding();
 const EXTENSION: &str = "ssketch";
-const SKETCH_VERSION: usize = 2;
+const SKETCH_VERSION: usize = 3;
 
 #[derive(bincode::Encode, bincode::Decode)]
 pub struct VersionedSketch {
-    /// This version of simd-sketch only supports encoding version 2.
+    /// This version of simd-sketch only supports encoding version 3.
     /// This is encoded first, so that it can (hopefully) still be recovered in case decoding fails.
     version: usize,
     /// The sketch itself.
@@ -472,23 +472,60 @@ struct SourmashSignature {
     hash_function: &'static str,
     max_hash: u64,
     molecule: &'static str,
-    mins: Vec<u64>,
+    mins: SignatureMins,
     abundances: Vec<u16>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SignatureMins {
+    U64(Vec<u64>),
+    U128(Vec<String>),
+}
+
+impl SignatureMins {
+    fn len(&self) -> usize {
+        match self {
+            SignatureMins::U64(v) => v.len(),
+            SignatureMins::U128(v) => v.len(),
+        }
+    }
 }
 
 fn sketch_to_sourmash(sketch: &simd_sketch::Sketch, path: &PathBuf) -> SourmashSignatureFile {
     let name = path.to_string_lossy().to_string();
     match sketch {
         simd_sketch::Sketch::BucketSketch(bucket) => {
-            let mut mins = Vec::new();
-            let mut abundances = Vec::new();
-            for (&kmer, &abundance) in bucket.kmers.iter().zip(bucket.abundances.iter()) {
-                if kmer == u64::MAX {
-                    continue;
+            let (mins, abundances, hash_function) = match &bucket.kmers {
+                simd_sketch::BucketKmers::U64(kmers) => {
+                    let mut mins = Vec::new();
+                    let mut abundances = Vec::new();
+                    for (&kmer, &abundance) in kmers.iter().zip(bucket.abundances.iter()) {
+                        if kmer == u64::MAX {
+                            continue;
+                        }
+                        mins.push(kmer);
+                        abundances.push(abundance);
+                    }
+                    (SignatureMins::U64(mins), abundances, "simd-sketch-kmer64")
                 }
-                mins.push(kmer);
-                abundances.push(abundance);
-            }
+                simd_sketch::BucketKmers::U128(kmers) => {
+                    let mut mins = Vec::new();
+                    let mut abundances = Vec::new();
+                    for (&kmer, &abundance) in kmers.iter().zip(bucket.abundances.iter()) {
+                        if kmer == u128::MAX {
+                            continue;
+                        }
+                        mins.push(kmer.to_string());
+                        abundances.push(abundance);
+                    }
+                    (
+                        SignatureMins::U128(mins),
+                        abundances,
+                        "simd-sketch-kmer128-decimal",
+                    )
+                }
+            };
             SourmashSignatureFile {
                 class: "sourmash_signature",
                 email: "",
@@ -498,7 +535,7 @@ fn sketch_to_sourmash(sketch: &simd_sketch::Sketch, path: &PathBuf) -> SourmashS
                     ksize: bucket.k,
                     num: mins.len(),
                     seed: bucket.seed,
-                    hash_function: "simd-sketch-kmer64",
+                    hash_function,
                     max_hash: 0,
                     molecule: "DNA",
                     mins,
