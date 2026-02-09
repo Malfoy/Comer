@@ -882,6 +882,7 @@ fn evaluate_sequence_filters(
     }
 }
 
+#[cfg(test)]
 fn first_failed_sequence_filter(
     seq: &[u8],
     filters: SequenceFilterArgs,
@@ -889,10 +890,12 @@ fn first_failed_sequence_filter(
     evaluate_sequence_filters(seq, filters, 1, false).reason
 }
 
+#[cfg(test)]
 fn candidate_kmer_count(seq: &[u8], k: usize, filter_out_n: bool) -> usize {
     evaluate_sequence_filters(seq, SequenceFilterArgs::default(), k, filter_out_n).candidate_kmers
 }
 
+#[cfg(test)]
 fn shannon_entropy_bits_per_base(seq: &[u8]) -> f32 {
     if seq.is_empty() {
         return 0.0;
