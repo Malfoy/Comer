@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
 use itertools::Itertools;
 use log::info;
@@ -78,7 +78,7 @@ pub fn classify(sketches: &[Sketch], reads: &Path) {
 
     // input
     info!("Reading..");
-    let seq = PackedNSeqVec::from_fastq_with_quality(reads, 20);
+    let seq = read_fastq_with_quality(reads, 20);
     info!("Sketching..");
 
     let mut read_hashes = vec![];
@@ -118,4 +118,120 @@ pub fn classify(sketches: &[Sketch], reads: &Path) {
         })
         .collect_vec();
     info!("Number of matching kmers per target and bucket: {per_bucket_counts:?}");
+}
+
+fn read_fastq_with_quality(path: &Path, min_qual: u8) -> PackedNSeqVec {
+    if has_extension(path, "zip") {
+        return read_fastq_with_quality_from_zip(path, min_qual);
+    }
+    PackedNSeqVec::from_fastq_with_quality(path, min_qual)
+}
+
+fn read_fastq_with_quality_from_zip(path: &Path, min_qual: u8) -> PackedNSeqVec {
+    let file = File::open(path)
+        .unwrap_or_else(|err| panic!("Failed to open zip archive {}: {err}", path.display()));
+    let mut archive = zip::ZipArchive::new(file)
+        .unwrap_or_else(|err| panic!("Failed to read zip archive {}: {err}", path.display()));
+
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx).unwrap_or_else(|err| {
+            panic!(
+                "Failed to access member #{idx} in zip archive {}: {err}",
+                path.display()
+            )
+        });
+        if entry.is_dir() || !is_fastq_member_name(entry.name()) {
+            continue;
+        }
+
+        let member_name = entry.name().to_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap_or_else(|err| {
+            panic!(
+                "Failed reading zip member {member_name} in {}: {err}",
+                path.display()
+            )
+        });
+
+        let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(bytes))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to parse FASTQ member {member_name} in {}: {err}",
+                    path.display()
+                )
+            });
+        return packed_nseq_from_fastq_reader(&mut reader, min_qual, path, &member_name);
+    }
+
+    panic!(
+        "No FASTQ member found in zip archive {}. Expected one of: .fq/.fastq (optionally compressed).",
+        path.display()
+    );
+}
+
+fn packed_nseq_from_fastq_reader(
+    reader: &mut Box<dyn needletail::FastxReader>,
+    min_qual: u8,
+    archive_path: &Path,
+    member_name: &str,
+) -> PackedNSeqVec {
+    let mut dna = Vec::new();
+    let mut qual = Vec::new();
+    let mut seqs = PackedNSeqVec::default();
+
+    while let Some(record) = reader.next() {
+        let seqrec = record.unwrap_or_else(|err| {
+            panic!(
+                "Invalid FASTQ record in zip member {member_name} (archive {}): {err}",
+                archive_path.display()
+            )
+        });
+        let quality = seqrec.qual().unwrap_or_else(|| {
+            panic!(
+                "Expected FASTQ record with qualities in zip member {member_name} (archive {}).",
+                archive_path.display()
+            )
+        });
+        dna.extend_from_slice(&seqrec.seq());
+        qual.extend_from_slice(quality);
+        dna.push(b'N');
+        qual.push(0);
+
+        if dna.len() > 16000 {
+            seqs.push_from_ascii_and_quality(&dna, &qual, min_qual);
+            dna.clear();
+            qual.clear();
+        }
+    }
+
+    if !dna.is_empty() {
+        seqs.push_from_ascii_and_quality(&dna, &qual, min_qual);
+    }
+
+    seqs
+}
+
+fn is_fastq_member_name(name: &str) -> bool {
+    let lowercase = name.to_ascii_lowercase();
+    let suffixes = [
+        ".fq",
+        ".fastq",
+        ".fq.gz",
+        ".fastq.gz",
+        ".fq.bz2",
+        ".fastq.bz2",
+        ".fq.xz",
+        ".fastq.xz",
+        ".fq.zst",
+        ".fastq.zst",
+        ".fq.zstd",
+        ".fastq.zstd",
+    ];
+    suffixes.iter().any(|suffix| lowercase.ends_with(suffix))
+}
+
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }

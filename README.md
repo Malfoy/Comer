@@ -51,7 +51,8 @@ Example:
 ```
 
 ### 3) Weighted Jaccard using bcalm/logan headers
-Bcalm/logan FASTA headers use tokens like `km:f:<abundance>` or `km:i:<abundance>`.
+Bcalm/logan FASTA headers use tokens like `km:f:<abundance>`, `ka:f:<abundance>`,
+`km:i:<abundance>`, or `ka:i:<abundance>`.
 When `--bcalm` is set, abundance is parsed from the header; if missing, it defaults to 1.
 Float abundances are rounded and clamped to `u16`.
 
@@ -100,7 +101,21 @@ Emits JSON with `mins` and `abundances` derived from the selected k-mers.
 
 ## Input formats
 - **FASTA/FASTQ** are supported. For FASTQ, sequences are read and sketched in the same way.
-- **Bcalm/Logan FASTA headers**: abundance can be encoded as `km:f:<float>` or `km:i:<int>`.
+- **Compression**: inputs can be plain text, `gzip` (`.gz`), `bzip2` (`.bz2`), `xz` (`.xz`), `zstd` (`.zst`/`.zstd`), or `.zip`.
+  For `.zip`, the first FASTA/FASTQ-like member in the archive is used.
+- **Optional sequence filters** (applied per FASTA/FASTQ record before sketching):
+  - `--min-seq-len <LEN>`
+  - `--max-n-fraction <FLOAT>` in `[0,1]`
+  - `--max-homopolymer-len <LEN>`
+  - `--min-entropy <BITS_PER_BASE>` (Shannon entropy)
+  If a sequence fails multiple filters, it is assigned to the first failing reason in the order above.
+  The CLI reports, for each enabled reason, how many sequences and candidate k-mers were removed.
+- **Ambiguous bases**:
+  - With `--filter-out-n`, any k-mer containing `N` or any non-`ACGT` base is skipped.
+  - Without `--filter-out-n`, non-`ACGT` characters are lossy-mapped into 2-bit DNA codes and are not filtered.
+  - Sequences are not removed solely because they contain non-`ACGTN` characters.
+- **Bcalm/Logan FASTA headers**: abundance can be encoded as `km:f:<float>`, `ka:f:<float>`,
+  `km:i:<int>`, or `ka:i:<int>`.
   Example header token: `>u1 LN:i:100 km:f:3.2 L:+:u2:+`
 
 
